@@ -1,0 +1,85 @@
+name: Build iPhone IPA
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK for the multiplatform project
+        uses: android-actions/setup-android@v3
+
+      - name: Prepare Xcode project
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew list xcodegen >/dev/null 2>&1 || brew install xcodegen
+          xcodebuild -version
+          chmod +x gradlew
+          # XcodeGen references this gitignored file even for unsigned builds.
+          touch iosApp/Signing.xcconfig
+          git rev-parse HEAD > source-commit.txt
+
+      - name: Build application and broadcast extension
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash iosApp/build-ipa.sh Release 2>&1 | tee build-iphone.log
+
+      - name: Verify IPA contains the broadcast extension
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import plistlib
+          import zipfile
+          from pathlib import PurePosixPath
+          with zipfile.ZipFile('iosApp/Pillion.ipa') as ipa:
+              names = ipa.namelist()
+              apps = [n for n in names if n.startswith('Payload/') and n.endswith('.app/Info.plist') and n.count('/') == 2]
+              assert len(apps) == 1, 'Expected one main iOS application'
+              broadcasts = []
+              for name in names:
+                  if name.endswith('.appex/Info.plist'):
+                      info = plistlib.loads(ipa.read(name))
+                      if info.get('NSExtension', {}).get('NSExtensionPointIdentifier') == 'com.apple.broadcast-services-upload':
+                          broadcasts.append(name)
+                          executable = str(PurePosixPath(name).parent / info['CFBundleExecutable'])
+                          assert executable in names, 'Broadcast executable missing'
+              assert len(broadcasts) == 1, 'ReplayKit broadcast extension missing'
+              print('IPA packaging verified; installation and motorcycle tests still required.')
+          PY
+
+      - name: Save iPhone installation file
+        uses: actions/upload-artifact@v4
+        with:
+          name: Pillion-iPhone
+          path: |
+            iosApp/Pillion.ipa
+            source-commit.txt
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Save build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: iPhone-build-log
+          path: build-iphone.log
+          if-no-files-found: ignore
+          retention-days: 7
